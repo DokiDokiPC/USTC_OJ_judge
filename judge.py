@@ -22,7 +22,7 @@ META_PATH = BOX_PATH + 'meta.txt'
 
 # 收到判题任务后的回调函数
 def on_message(channel, method_frame, header_frame, body):
-    task = json.load(body)
+    task = json.loads(body.decode('utf-8'))
     # 获取时间和内存限制
     TIME_LIMIT = 1
     WALL_TIME_LIMIT = 2 * TIME_LIMIT
