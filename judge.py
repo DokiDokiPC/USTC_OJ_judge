@@ -6,7 +6,7 @@ import pika
 
 # 配置
 AMQP_URI = toml.load('config.toml')['AMQP_URI']
-QUEUE = 'judge_request_queue'
+QUEUE_NAME = 'judge_request_queue'
 PREFETCH_COUNT = 32  # 最大预取数量
 BOX_ID = '0'  # 同一机器运行多个worker, 每个需要分配不同的BOX_ID
 BOX_PATH = f'/var/local/lib/isolate/{BOX_ID}/box/'
@@ -60,9 +60,10 @@ def on_message(channel, method_frame, header_frame, body):
 
 connection = pika.BlockingConnection(pika.URLParameters(AMQP_URI))
 channel = connection.channel()
+channel.queue_declare(QUEUE_NAME)
 channel.basic_qos(prefetch_count=PREFETCH_COUNT)
 channel.basic_consume(
-    queue=QUEUE,
+    queue=QUEUE_NAME,
     on_message_callback=on_message,
     auto_ack=True
 )
