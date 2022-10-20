@@ -33,6 +33,10 @@ PREFETCH_COUNT = 32  # 最大预取数量
 BOX_ID = '0'  # 同一机器运行多个worker, 每个需要分配不同的BOX_ID
 BOX_PATH = f'/var/local/lib/isolate/{BOX_ID}/box/'
 META_PATH = BOX_PATH + 'meta.txt'
+INPUT_NAME = 'in.txt'
+ANS_NAME = 'out.txt'
+OUTPUT_NAME = 'out.txt'
+PROBLEMS_PATH = '/home/tanix/USTC_OJ_judge/problems/'
 
 # 编译器配置
 COMPILE_TIME_LIMIT = 4
@@ -60,6 +64,7 @@ limit_query = 'select time_limit, memory_limit from problem where id = %s'
 update_status_sql = 'update submission set status = %s, time_cost = %s, memory_cost = %s where id = %s'
 inc_submit_sql = 'update problem set submit_num = submit_num + 1 where id = %s'
 inc_submit_and_ac_sql = 'update problem set submit_num = submit_num + 1, ac_num = ac_num + 1 where id = %s'
+add_passed_problem_sql = 'insert ignore into passed_problem set username = %s, problem_id = %s'
 
 def get_limits(problem_id):
     cursor.execute(limit_query, (problem_id,))
@@ -75,6 +80,10 @@ def inc_submit_num(problem_id):
 
 def inc_submit_and_ac_num(problem_id):
     cursor.execute(inc_submit_and_ac_sql, (problem_id,))
+    cnx.commit()
+
+def add_passed_problem(username, problem_id):
+    cursor.execute(add_passed_problem_sql, (username, problem_id))
     cnx.commit()
 
 # submisison状态
@@ -95,19 +104,23 @@ class SubmissionStatus:
 # meta文件读取所用正则表达式
 time_pattern = re.compile(r'time:(.*)')
 mem_pattern = re.compile(r'cg-mem:(.*)')
+rss_pattern = re.compile(r'max-rss:(.*)')
 msg_pattern = re.compile(r'message:(.*)')
 
 def parse_meta(meta_text):
     message = re.search(msg_pattern, meta_text)
     if message is not None:
         message = message.group(1)
-    memory_cost = re.search(mem_pattern, meta_text)
+    total_memory = re.search(mem_pattern, meta_text)
+    if total_memory is not None:
+        total_memory = int(total_memory.group(1))
+    memory_cost = re.search(rss_pattern, meta_text)
     if memory_cost is not None:
         memory_cost = int(memory_cost.group(1))
     time_cost = re.search(time_pattern, meta_text)
     if time_cost is not None:
         time_cost = ceil(float(time_cost.group(1)) * 1000)  # ms
-    return message, memory_cost, time_cost
+    return message, total_memory, memory_cost, time_cost
 
 
 # 收到判题任务后的回调函数
@@ -129,7 +142,10 @@ def on_message(_channel, _method_frame, _header_frame, body):
         return
 
     # 创建box
-    subprocess.run(['isolate', '--cg', f'--box-id={BOX_ID}', '--init'], stdout=subprocess.DEVNULL)
+    subprocess.run(
+        ['isolate', '--cg', f'--box-id={BOX_ID}', '--init'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+    )
 
     # 将src_code写入文件
     with open(compiler_config['SRC_PATH'], 'w') as f:
@@ -146,60 +162,98 @@ def on_message(_channel, _method_frame, _header_frame, body):
             '--run', '--', compiler_config['PATH'], '-static', compiler_config['SRC_NAME']
         ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT).check_returncode()
     except subprocess.CalledProcessError:
-        log.debug("compile error")
+        # 编译错误
+        log.debug('compile error')
+        # 设置对应submission状态为CE
+        update_submission(task['submission_id'], SubmissionStatus.CompileError)
+        # problem提交数量加1
+        inc_submit_num(task['problem_id'])
         # 清理
         subprocess.run([
             'isolate', '--cg', f'--box-id={BOX_ID}',
             '--cleanup'
         ])
-        # 设置对应submission状态为CE
-        update_submission(task['submission_id'], SubmissionStatus.CompileError)
-        # problem提交数量加1
-        inc_submit_num(task['problem_id'])
         return
+
+    DATA_PATH = PROBLEMS_PATH + str(task['problem_id']) + '/'
 
     # 运行
     subprocess.run([
         'isolate', '--cg', f'--box-id={BOX_ID}',
         f'--time={TIME_LIMIT}', f'--wall-time={WALL_TIME_LIMIT}',
         f'--cg-mem={MEM_LIMIT}',
-        '--no-default-dirs', '--dir=box=./box:rw',
+        '--no-default-dirs', '--dir=box=./box:rw', f'--dir=data={DATA_PATH}',
+        f'--stdin=/data/{INPUT_NAME}', f'--stdout={OUTPUT_NAME}', '--stderr-to-stdout',
         f'--meta={META_PATH}',
         '--run', '--', compiler_config['BIN_NAME']
     ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     # 查看运行结果
     with open(META_PATH, 'r') as f:
-        message, memory_cost, time_cost = parse_meta(f.read())
+        message, total_memory, memory_cost, time_cost = parse_meta(f.read())
+        if total_memory > MEM_LIMIT:
+            memory_cost = total_memory
         if message is not None:
             # 出错
+            log.debug(message)
             if memory_cost > MEM_LIMIT:
                 # 超内存
                 update_submission(
                     task['submission_id'], SubmissionStatus.MemoryLimitExceeded,
                     time_cost, memory_cost
                 )
-                # problem提交数量加1
-                inc_submit_num(task['problem_id'])
             elif time_cost > TIME_LIMIT * 1000:
                 # 超时
                 update_submission(
                     task['submission_id'], SubmissionStatus.TimeLimitExceeded,
                     time_cost, memory_cost
                 )
-                inc_submit_num(task['problem_id'])
             else:
-                # Runtime Error
+                # 运行时出错
                 update_submission(
                     task['submission_id'], SubmissionStatus.RuntimeError,
                     time_cost, memory_cost
                 )
+            # 提交数加1
+            inc_submit_num(task['problem_id'])
+            # 清理
+            subprocess.run([
+                'isolate', '--cg', f'--box-id={BOX_ID}',
+                '--cleanup'
+            ])
             return
 
     # 和答案对比
+    correct = True
+    with open(BOX_PATH + OUTPUT_NAME) as out:
+        with open(DATA_PATH + ANS_NAME) as ans:
+            out_lines = out.readlines()
+            ans_lines = ans.readlines()
+            if len(out_lines) != len(ans_lines):
+                correct = False
+            else:
+                for l1, l2 in zip(out_lines, ans_lines):
+                    if l1.strip() != l2.strip():
+                        correct = False
+                        break
 
-
-    # 修改submission状态, 更改problem提交数和通过数, 修改PassedProblem
+    if correct:
+        # AC, 修改submission状态, 更改problem提交数和通过数, 添加PassedProblem记录
+        log.debug('Accepted')
+        update_submission(
+            task['submission_id'], SubmissionStatus.Accepted,
+            time_cost, memory_cost
+        )
+        inc_submit_and_ac_num(task['problem_id'])
+        add_passed_problem(task['username'], task['problem_id'])
+    else:
+        # Wrong Answer
+        log.debug('Wrong Answer')
+        update_submission(
+            task['submission_id'], SubmissionStatus.WrongAnswer,
+            time_cost, memory_cost
+        )
+        inc_submit_num(task['problem_id'])
 
     # 清理
     subprocess.run([
@@ -224,3 +278,4 @@ except KeyboardInterrupt:
 connection.close()
 cursor.close()
 cnx.close()
+
