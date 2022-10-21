@@ -49,7 +49,7 @@ COMPILER = {
         'SRC_PATH': BOX_PATH + 'a.c',
         'BIN_NAME': 'a.out',
     },
-    'G++': {
+    'GPP': {
         'PATH': '/usr/bin/g++',
         'SRC_NAME': 'a.cpp',
         'SRC_PATH': BOX_PATH + 'a.cpp',
@@ -278,4 +278,3 @@ except KeyboardInterrupt:
 connection.close()
 cursor.close()
 cnx.close()
-
