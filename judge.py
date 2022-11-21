@@ -8,13 +8,15 @@ from math import ceil
 import toml
 import pika
 import mysql.connector
+from mysql.connector import errorcode
 
 # 读取toml
 config_toml = toml.load('config.toml')
 
 # log配置
-log_level = logging.DEBUG;
-log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(funcName)s line %(lineno)d: %(message)s')
+log_level = logging.DEBUG
+log_formatter = logging.Formatter(
+    '%(asctime)s %(levelname)s %(funcName)s line %(lineno)d: %(message)s')
 log_path = 'log.txt'
 log_hander = RotatingFileHandler(
     log_path, mode='a', maxBytes=64*1024*1024, backupCount=2, encoding='utf-8', delay=False)
@@ -58,33 +60,71 @@ COMPILER = {
 }
 
 # mysql配置
-cnx = mysql.connector.connect(**config_toml['mysql_config'])
+try:
+    cnx = mysql.connector.connect(**config_toml['mysql_config'])
+except mysql.connector.Error as err:
+    if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+        log.error("Something is wrong with your user name or password")
+    elif err.errno == errorcode.ER_BAD_DB_ERROR:
+        log.error("Database does not exist")
+    else:
+        log.error(err)
+else:
+    cnx.close()
 cursor = cnx.cursor()
 limit_query = 'select time_limit, memory_limit from problem where id = %s'
 update_status_sql = 'update submission set status = %s, time_cost = %s, memory_cost = %s where id = %s'
 inc_submit_sql = 'update problem set submit_num = submit_num + 1 where id = %s'
 inc_submit_and_ac_sql = 'update problem set submit_num = submit_num + 1, ac_num = ac_num + 1 where id = %s'
-add_passed_problem_sql = 'insert ignore into passed_problem set username = %s, problem_id = %s'
+add_passed_record_sql = 'insert into user_problem_passed(username, problem_id) values (%s, %s)'
+inc_passed_sql = 'update user set passed = passed + 1 where username = %s'
+
 
 def get_limits(problem_id):
-    cursor.execute(limit_query, (problem_id,))
-    return cursor.fetchone() or (None, None)
+    try:
+        cursor.execute(limit_query, (problem_id,))
+        return cursor.fetchone() or (None, None)
+    except mysql.connector.Error as err:
+        log.error(err)
+        cnx.rollback()
 
 def update_submission(submission_id, status, time_cost=None, memory_cost=None):
-    cursor.execute(update_status_sql, (status, time_cost, memory_cost, submission_id))
-    cnx.commit()
+    try:
+        cursor.execute(update_status_sql,
+                    (status, time_cost, memory_cost, submission_id))
+        cnx.commit()
+    except mysql.connector.Error as err:
+        log.error(err)
+        cnx.rollback()
+
 
 def inc_submit_num(problem_id):
-    cursor.execute(inc_submit_sql, (problem_id,))
-    cnx.commit()
+    try:
+        cursor.execute(inc_submit_sql, (problem_id,))
+        cnx.commit()
+    except mysql.connector.Error as err:
+        log.error(err)
+        cnx.rollback()
+
 
 def inc_submit_and_ac_num(problem_id):
-    cursor.execute(inc_submit_and_ac_sql, (problem_id,))
-    cnx.commit()
+    try:
+        cursor.execute(inc_submit_and_ac_sql, (problem_id,))
+        cnx.commit()
+    except mysql.connector.Error as err:
+        log.error(err)
+        cnx.rollback()
 
-def add_passed_problem(username, problem_id):
-    cursor.execute(add_passed_problem_sql, (username, problem_id))
-    cnx.commit()
+
+def add_passed_num(username, problem_id):
+    try:
+        cursor.execute(add_passed_record_sql, (username, problem_id))
+        cursor.execute(add_passed_num, (username,))
+        cnx.commit()
+    except mysql.connector.Error as err:
+        log.error(err)
+        cnx.rollback()
+
 
 # submisison状态
 class SubmissionStatus:
@@ -101,11 +141,13 @@ class SubmissionStatus:
     MemoryLimitExceeded = 'MemoryLimitExceeded'
     WrongAnswer = 'WrongAnswer'
 
+
 # meta文件读取所用正则表达式
 time_pattern = re.compile(r'time:(.*)')
 mem_pattern = re.compile(r'cg-mem:(.*)')
 rss_pattern = re.compile(r'max-rss:(.*)')
 msg_pattern = re.compile(r'message:(.*)')
+
 
 def parse_meta(meta_text):
     message = re.search(msg_pattern, meta_text)
@@ -245,7 +287,7 @@ def on_message(_channel, _method_frame, _header_frame, body):
             time_cost, memory_cost
         )
         inc_submit_and_ac_num(task['problem_id'])
-        add_passed_problem(task['username'], task['problem_id'])
+        add_passed_num(task['username'], task['problem_id'])
     else:
         # Wrong Answer
         log.debug('Wrong Answer')
