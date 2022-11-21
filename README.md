@@ -14,7 +14,7 @@
 AMQP_URI = "amqp://guest:guest@localhost:5672/%2F?connection_attempts=3&heartbeat=3600"
 [mysql_config]
 host = "localhost"
-user = "ustcoj"
+user = "root"
 password = "1234"
 database = "ustcoj"
 ```
@@ -32,3 +32,5 @@ problems/
     ├── ans.txt
     └── in.txt
 ```
+
+执行时标准输入输出分别重定位至in.txt、out.txt。
