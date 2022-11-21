@@ -70,8 +70,7 @@ except mysql.connector.Error as err:
     else:
         log.error(err)
 else:
-    cnx.close()
-cursor = cnx.cursor()
+    cursor = cnx.cursor()
 limit_query = 'select time_limit, memory_limit from problem where id = %s'
 update_status_sql = 'update submission set status = %s, time_cost = %s, memory_cost = %s where id = %s'
 inc_submit_sql = 'update problem set submit_num = submit_num + 1 where id = %s'
@@ -88,10 +87,11 @@ def get_limits(problem_id):
         log.error(err)
         cnx.rollback()
 
+
 def update_submission(submission_id, status, time_cost=None, memory_cost=None):
     try:
         cursor.execute(update_status_sql,
-                    (status, time_cost, memory_cost, submission_id))
+                       (status, time_cost, memory_cost, submission_id))
         cnx.commit()
     except mysql.connector.Error as err:
         log.error(err)
