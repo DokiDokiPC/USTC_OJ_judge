@@ -72,11 +72,12 @@ except mysql.connector.Error as err:
 else:
     cursor = cnx.cursor()
 limit_query = 'select time_limit, memory_limit from problem where id = %s'
-update_status_sql = 'update submission set status = %s, time_cost = %s, memory_cost = %s where id = %s'
+update_submission_sql = 'update submission set status = %s, time_cost = %s, memory_cost = %s where id = %s'
+update_status_sql = 'update submission set status = %s where id = %s'
 inc_submit_sql = 'update problem set submit_num = submit_num + 1 where id = %s'
 inc_submit_and_ac_sql = 'update problem set submit_num = submit_num + 1, ac_num = ac_num + 1 where id = %s'
 add_passed_record_sql = 'insert into user_problem_passed(username, problem_id) values (%s, %s)'
-inc_passed_sql = 'update user set passed = passed + 1 where username = %s'
+inc_solved_sql = 'update user set solved = solved + 1 where username = %s'
 
 
 def get_limits(problem_id):
@@ -90,8 +91,15 @@ def get_limits(problem_id):
 
 def update_submission(submission_id, status, time_cost=None, memory_cost=None):
     try:
-        cursor.execute(update_status_sql,
-                       (status, time_cost, memory_cost, submission_id))
+        if time_cost is None and memory_cost is None:
+            cursor.execute(update_status_sql, (status, submission_id))
+        else:
+            if time_cost is None:
+                time_cost = -1
+            if memory_cost is None:
+                memory_cost = -1
+            cursor.execute(update_submission_sql,
+                        (status, time_cost, memory_cost, submission_id))
         cnx.commit()
     except mysql.connector.Error as err:
         log.error(err)
@@ -116,10 +124,10 @@ def inc_submit_and_ac_num(problem_id):
         cnx.rollback()
 
 
-def add_passed_num(username, problem_id):
+def add_passed_record(username, problem_id):
     try:
         cursor.execute(add_passed_record_sql, (username, problem_id))
-        cursor.execute(add_passed_num, (username,))
+        cursor.execute(inc_solved_sql, (username,))
         cnx.commit()
     except mysql.connector.Error as err:
         log.error(err)
@@ -280,14 +288,14 @@ def on_message(_channel, _method_frame, _header_frame, body):
                         break
 
     if correct:
-        # AC, 修改submission状态, 更改problem提交数和通过数, 添加PassedProblem记录
+        # AC, 修改submission状态, 更改problem提交数和通过数, 添加通过记录
         log.debug('Accepted')
         update_submission(
             task['submission_id'], SubmissionStatus.Accepted,
             time_cost, memory_cost
         )
         inc_submit_and_ac_num(task['problem_id'])
-        add_passed_num(task['username'], task['problem_id'])
+        add_passed_record(task['username'], task['problem_id'])
     else:
         # Wrong Answer
         log.debug('Wrong Answer')
