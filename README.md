@@ -33,4 +33,5 @@ problems/
     └── in.txt
 ```
 
-执行时标准输入输出分别重定位至in.txt、out.txt。
+执行时标准输入输出分别重定向至in.txt、out.txt。
+
