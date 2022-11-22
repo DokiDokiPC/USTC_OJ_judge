@@ -52,6 +52,9 @@ def parse_meta(meta_text):
 def on_message(_channel, _method_frame, _header_frame, body):
     # task是一个字典, 有submission_id, problem_id, username, compiler, source_code字段
     task = json.loads(body.decode('utf-8'))
+    log.debug(f'submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
+              f'username: {task["username"]}, compiler: {task["compiler"]}, '
+              f'source_code:\n{task["source_code"]}')
 
     # 获取时间和内存限制
     time_limit, mem_limit = get_limits(task['problem_id'])
@@ -60,6 +63,7 @@ def on_message(_channel, _method_frame, _header_frame, body):
         return
     time_limit /= 1000  # isolate时间单位是秒, 而数据库里的单位是毫秒
     wall_time_limit = 2 * time_limit
+    log.debug(f'time_limit: {time_limit}, mem_limit: {mem_limit}')
 
     # 获取编译器设置
     compiler_config = Config.COMPILER.get(task['compiler'], None)
@@ -89,8 +93,7 @@ def on_message(_channel, _method_frame, _header_frame, body):
         ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT).check_returncode()
     except subprocess.CalledProcessError:
         # 编译错误
-        log.debug(f'compile error, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
-                  f'username: {task["username"]}, compiler: {task["compiler"]}')
+        log.debug('compile error')
         # 设置对应submission状态为CE
         update_submission(task['submission_id'], SubmissionStatus.CompileError)
         # problem提交数量加1
@@ -118,26 +121,29 @@ def on_message(_channel, _method_frame, _header_frame, body):
     # 查看运行结果
     with open(Config.META_PATH, 'r') as f:
         message, total_memory, memory_cost, time_cost = parse_meta(f.read())
+        log.debug(f'message: {message}, total_memory: {total_memory}, memory_cost: {memory_cost}, '
+                  f'time_cost: {time_cost}')
         if total_memory > mem_limit:
             memory_cost = total_memory
         if message is not None:
             # 出错
-            log.debug(f'{message}, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
-                      f'username: {task["username"]}, compiler: {task["compiler"]}')
             if memory_cost > mem_limit:
                 # 超内存
+                log.debug('MemoryLimitExceeded')
                 update_submission(
                     task['submission_id'], SubmissionStatus.MemoryLimitExceeded,
                     time_cost, memory_cost
                 )
             elif time_cost > time_limit * 1000:
                 # 超时
+                log.debug('TimeLimitExceeded')
                 update_submission(
                     task['submission_id'], SubmissionStatus.TimeLimitExceeded,
                     time_cost, memory_cost
                 )
             else:
                 # 运行时出错
+                log.debug('RuntimeError')
                 update_submission(
                     task['submission_id'], SubmissionStatus.RuntimeError,
                     time_cost, memory_cost
@@ -167,8 +173,7 @@ def on_message(_channel, _method_frame, _header_frame, body):
 
     if correct:
         # AC, 修改submission状态, 更改problem提交数和通过数, 添加通过记录
-        log.debug(f'Accepted, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
-                  f'username: {task["username"]}, compiler: {task["compiler"]}')
+        log.debug('Accepted')
         update_submission(
             task['submission_id'], SubmissionStatus.Accepted,
             time_cost, memory_cost
@@ -177,8 +182,7 @@ def on_message(_channel, _method_frame, _header_frame, body):
         add_passed_record(task['username'], task['problem_id'])
     else:
         # Wrong Answer
-        log.debug(f'Wrong Answer, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
-                  f'username: {task["username"]}, compiler: {task["compiler"]}')
+        log.debug('Wrong Answer')
         update_submission(
             task['submission_id'], SubmissionStatus.WrongAnswer,
             time_cost, memory_cost
