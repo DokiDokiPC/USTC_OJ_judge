@@ -58,7 +58,7 @@ problems/
 
 运行
 ```bash
-sudo -i
+su root
 python judge.py
 ```
 
