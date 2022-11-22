@@ -2,3 +2,4 @@ config.toml
 log.txt
 problems/
 .idea/
+__pycache__

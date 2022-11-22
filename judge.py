@@ -1,137 +1,12 @@
-import logging
-from logging.handlers import RotatingFileHandler
 import subprocess
 import json
 import re
 from math import ceil
 
-import toml
-import pika
-import mysql.connector
-from mysql.connector import errorcode
-
-# 读取toml
-config_toml = toml.load('config.toml')
-
-# log配置
-log_level = logging.DEBUG
-log_formatter = logging.Formatter(
-    '%(asctime)s %(levelname)s %(funcName)s line %(lineno)d: %(message)s')
-log_path = 'log.txt'
-log_hander = RotatingFileHandler(
-    log_path, mode='a', maxBytes=64*1024*1024, backupCount=2, encoding='utf-8', delay=False)
-log_hander.setFormatter(log_formatter)
-log_hander.setLevel(log_level)
-log = logging.getLogger(__name__)
-log.setLevel(log_level)
-log.addHandler(log_hander)
-
-# 消息队列配置
-AMQP_URI = config_toml['AMQP_URI']
-QUEUE_NAME = 'judge_request_queue'
-PREFETCH_COUNT = 32  # 最大预取数量
-
-# isolate配置
-BOX_ID = '0'  # 同一机器运行多个worker, 每个需要分配不同的BOX_ID
-BOX_PATH = f'/var/local/lib/isolate/{BOX_ID}/box/'
-META_PATH = BOX_PATH + 'meta.txt'
-INPUT_NAME = 'in.txt'
-ANS_NAME = 'out.txt'
-OUTPUT_NAME = 'out.txt'
-PROBLEMS_PATH = '/home/tanix/USTC_OJ_judge/problems/'
-
-# 编译器配置
-COMPILE_TIME_LIMIT = 4
-COMPILE_WALL_TIME_LIMIT = 8
-COMPILE_MEM_LIMIT = 262144
-COMPILER = {
-    'GCC': {
-        'PATH': '/usr/bin/gcc',
-        'SRC_NAME': 'a.c',
-        'SRC_PATH': BOX_PATH + 'a.c',
-        'BIN_NAME': 'a.out',
-    },
-    'GPP': {
-        'PATH': '/usr/bin/g++',
-        'SRC_NAME': 'a.cpp',
-        'SRC_PATH': BOX_PATH + 'a.cpp',
-        'BIN_NAME': 'a.out',
-    }
-}
-
-# mysql配置
-try:
-    cnx = mysql.connector.connect(**config_toml['mysql_config'])
-except mysql.connector.Error as err:
-    if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
-        log.error("Something is wrong with your user name or password")
-    elif err.errno == errorcode.ER_BAD_DB_ERROR:
-        log.error("Database does not exist")
-    else:
-        log.error(err)
-else:
-    cursor = cnx.cursor()
-limit_query = 'select time_limit, memory_limit from problem where id = %s'
-update_submission_sql = 'update submission set status = %s, time_cost = %s, memory_cost = %s where id = %s'
-update_status_sql = 'update submission set status = %s where id = %s'
-inc_submit_sql = 'update problem set submit_num = submit_num + 1 where id = %s'
-inc_submit_and_ac_sql = 'update problem set submit_num = submit_num + 1, ac_num = ac_num + 1 where id = %s'
-add_passed_record_sql = 'insert into user_problem_passed(username, problem_id) values (%s, %s)'
-inc_solved_sql = 'update user set solved = solved + 1 where username = %s'
-
-
-def get_limits(problem_id):
-    try:
-        cursor.execute(limit_query, (problem_id,))
-        return cursor.fetchone() or (None, None)
-    except mysql.connector.Error as err:
-        log.error(err)
-        cnx.rollback()
-
-
-def update_submission(submission_id, status, time_cost=None, memory_cost=None):
-    try:
-        if time_cost is None and memory_cost is None:
-            cursor.execute(update_status_sql, (status, submission_id))
-        else:
-            if time_cost is None:
-                time_cost = -1
-            if memory_cost is None:
-                memory_cost = -1
-            cursor.execute(update_submission_sql,
-                        (status, time_cost, memory_cost, submission_id))
-        cnx.commit()
-    except mysql.connector.Error as err:
-        log.error(err)
-        cnx.rollback()
-
-
-def inc_submit_num(problem_id):
-    try:
-        cursor.execute(inc_submit_sql, (problem_id,))
-        cnx.commit()
-    except mysql.connector.Error as err:
-        log.error(err)
-        cnx.rollback()
-
-
-def inc_submit_and_ac_num(problem_id):
-    try:
-        cursor.execute(inc_submit_and_ac_sql, (problem_id,))
-        cnx.commit()
-    except mysql.connector.Error as err:
-        log.error(err)
-        cnx.rollback()
-
-
-def add_passed_record(username, problem_id):
-    try:
-        cursor.execute(add_passed_record_sql, (username, problem_id))
-        cursor.execute(inc_solved_sql, (username,))
-        cnx.commit()
-    except mysql.connector.Error as err:
-        log.error(err)
-        cnx.rollback()
+from db import *
+from config import Config
+from log import log
+from mq import mq_connection, mq_channel
 
 
 # submisison状态
@@ -175,25 +50,26 @@ def parse_meta(meta_text):
 
 # 收到判题任务后的回调函数
 def on_message(_channel, _method_frame, _header_frame, body):
+    # task是一个字典, 有submission_id, problem_id, username, compiler, source_code字段
     task = json.loads(body.decode('utf-8'))
 
     # 获取时间和内存限制
-    TIME_LIMIT, MEM_LIMIT = get_limits(task['problem_id'])
-    if TIME_LIMIT is None:
-        log.error(f"TIME_LIMT of problem {task['problem_id']} is None")
+    time_limit, mem_limit = get_limits(task['problem_id'])
+    if time_limit is None:
+        log.error(f"time_limit of problem {task['problem_id']} is None")
         return
-    TIME_LIMIT /= 1000  # isolate时间单位是秒, 而数据库里的单位是毫秒
-    WALL_TIME_LIMIT = 2 * TIME_LIMIT
+    time_limit /= 1000  # isolate时间单位是秒, 而数据库里的单位是毫秒
+    wall_time_limit = 2 * time_limit
 
     # 获取编译器设置
-    compiler_config = COMPILER.get(task['compiler'], None)
+    compiler_config = Config.COMPILER.get(task['compiler'], None)
     if compiler_config is None:
         log.error(f"compiler '{task['compiler']}' is not available")
         return
 
     # 创建box
     subprocess.run(
-        ['isolate', '--cg', f'--box-id={BOX_ID}', '--init'],
+        ['isolate', '--cg', f'--box-id={Config.BOX_ID}', '--init'],
         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
     )
 
@@ -204,55 +80,57 @@ def on_message(_channel, _method_frame, _header_frame, body):
     # 静态编译
     try:
         subprocess.run([
-            'isolate', '--cg', f'--box-id={BOX_ID}',
-            f'--time={COMPILE_TIME_LIMIT}', f'--wall-time={COMPILE_WALL_TIME_LIMIT}',
-            f'--cg-mem={COMPILE_MEM_LIMIT}',
+            'isolate', '--cg', f'--box-id={Config.BOX_ID}',
+            f'--time={Config.COMPILE_TIME_LIMIT}', f'--wall-time={Config.COMPILE_WALL_TIME_LIMIT}',
+            f'--cg-mem={Config.COMPILE_MEM_LIMIT}',
             '--processes', '--full-env',
-            f'--meta={META_PATH}',
+            f'--meta={Config.META_PATH}',
             '--run', '--', compiler_config['PATH'], '-static', compiler_config['SRC_NAME']
         ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT).check_returncode()
     except subprocess.CalledProcessError:
         # 编译错误
-        log.debug('compile error')
+        log.debug(f'compile error, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
+                  f'username: {task["username"]}, compiler: {task["compiler"]}')
         # 设置对应submission状态为CE
         update_submission(task['submission_id'], SubmissionStatus.CompileError)
         # problem提交数量加1
         inc_submit_num(task['problem_id'])
         # 清理
         subprocess.run([
-            'isolate', '--cg', f'--box-id={BOX_ID}',
+            'isolate', '--cg', f'--box-id={Config.BOX_ID}',
             '--cleanup'
         ])
         return
 
-    DATA_PATH = PROBLEMS_PATH + str(task['problem_id']) + '/'
+    data_path = Config.PROBLEMS_PATH + str(task['problem_id']) + '/'
 
     # 运行
     subprocess.run([
-        'isolate', '--cg', f'--box-id={BOX_ID}',
-        f'--time={TIME_LIMIT}', f'--wall-time={WALL_TIME_LIMIT}',
-        f'--cg-mem={MEM_LIMIT}',
-        '--no-default-dirs', '--dir=box=./box:rw', f'--dir=data={DATA_PATH}',
-        f'--stdin=/data/{INPUT_NAME}', f'--stdout={OUTPUT_NAME}', '--stderr-to-stdout',
-        f'--meta={META_PATH}',
+        'isolate', '--cg', f'--box-id={Config.BOX_ID}',
+        f'--time={time_limit}', f'--wall-time={wall_time_limit}',
+        f'--cg-mem={mem_limit}',
+        '--no-default-dirs', '--dir=box=./box:rw', f'--dir=data={data_path}',
+        f'--stdin=/data/{Config.INPUT_NAME}', f'--stdout={Config.OUTPUT_NAME}', '--stderr-to-stdout',
+        f'--meta={Config.META_PATH}',
         '--run', '--', compiler_config['BIN_NAME']
     ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     # 查看运行结果
-    with open(META_PATH, 'r') as f:
+    with open(Config.META_PATH, 'r') as f:
         message, total_memory, memory_cost, time_cost = parse_meta(f.read())
-        if total_memory > MEM_LIMIT:
+        if total_memory > mem_limit:
             memory_cost = total_memory
         if message is not None:
             # 出错
-            log.debug(message)
-            if memory_cost > MEM_LIMIT:
+            log.debug(f'{message}, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
+                      f'username: {task["username"]}, compiler: {task["compiler"]}')
+            if memory_cost > mem_limit:
                 # 超内存
                 update_submission(
                     task['submission_id'], SubmissionStatus.MemoryLimitExceeded,
                     time_cost, memory_cost
                 )
-            elif time_cost > TIME_LIMIT * 1000:
+            elif time_cost > time_limit * 1000:
                 # 超时
                 update_submission(
                     task['submission_id'], SubmissionStatus.TimeLimitExceeded,
@@ -268,15 +146,15 @@ def on_message(_channel, _method_frame, _header_frame, body):
             inc_submit_num(task['problem_id'])
             # 清理
             subprocess.run([
-                'isolate', '--cg', f'--box-id={BOX_ID}',
+                'isolate', '--cg', f'--box-id={Config.BOX_ID}',
                 '--cleanup'
             ])
             return
 
     # 和答案对比
     correct = True
-    with open(BOX_PATH + OUTPUT_NAME) as out:
-        with open(DATA_PATH + ANS_NAME) as ans:
+    with open(Config.BOX_PATH + Config.OUTPUT_NAME) as out:
+        with open(data_path + Config.ANS_NAME) as ans:
             out_lines = out.readlines()
             ans_lines = ans.readlines()
             if len(out_lines) != len(ans_lines):
@@ -289,7 +167,8 @@ def on_message(_channel, _method_frame, _header_frame, body):
 
     if correct:
         # AC, 修改submission状态, 更改problem提交数和通过数, 添加通过记录
-        log.debug('Accepted')
+        log.debug(f'Accepted, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
+                  f'username: {task["username"]}, compiler: {task["compiler"]}')
         update_submission(
             task['submission_id'], SubmissionStatus.Accepted,
             time_cost, memory_cost
@@ -298,7 +177,8 @@ def on_message(_channel, _method_frame, _header_frame, body):
         add_passed_record(task['username'], task['problem_id'])
     else:
         # Wrong Answer
-        log.debug('Wrong Answer')
+        log.debug(f'Wrong Answer, submission_id: {task["submission_id"]}, problem_id: {task["problem_id"]}, '
+                  f'username: {task["username"]}, compiler: {task["compiler"]}')
         update_submission(
             task['submission_id'], SubmissionStatus.WrongAnswer,
             time_cost, memory_cost
@@ -307,24 +187,28 @@ def on_message(_channel, _method_frame, _header_frame, body):
 
     # 清理
     subprocess.run([
-        'isolate', '--cg', f'--box-id={BOX_ID}',
+        'isolate', '--cg', f'--box-id={Config.BOX_ID}',
         '--cleanup'
     ])
 
 
-connection = pika.BlockingConnection(pika.URLParameters(AMQP_URI))
-channel = connection.channel()
-channel.queue_declare(QUEUE_NAME)
-channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-channel.basic_consume(
-    queue=QUEUE_NAME,
+# 将mq_channel和on_message绑定
+mq_channel.basic_consume(
+    queue=Config.QUEUE_NAME,
     on_message_callback=on_message,
     auto_ack=True
 )
 try:
-    channel.start_consuming()
+    # worker启动
+    log.info('start consuming')
+    print('start consuming, you can check the log using command `tail -F log.txt` in another shell')
+    mq_channel.start_consuming()
 except KeyboardInterrupt:
-    channel.stop_consuming()
-connection.close()
-cursor.close()
-cnx.close()
+    # worker关闭
+    mq_channel.stop_consuming()
+    mq_connection.close()
+    db_cursor.close()
+    db_cnx.close()
+    msg = 'consuming stopped'
+    log.info(msg)
+    print(msg)
